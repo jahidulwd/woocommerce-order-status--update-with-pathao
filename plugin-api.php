@@ -1,0 +1,615 @@
+<?php
+
+// For logged-in users
+add_action('wp_ajax_get_stores', 'pt_hms_ajax_get_stores');
+add_action('wp_ajax_get_cities', 'pt_hms_ajax_get_cities');
+add_action('wp_ajax_get_zones', 'pt_hms_ajax_get_zones');
+add_action('wp_ajax_get_areas', 'pt_hms_ajax_get_areas');
+add_action('wp_ajax_get_zone_list_bulk', 'pt_hms_ajax_get_zone_list_bulk');
+add_action('wp_ajax_get_area_list_bulk', 'pt_hms_ajax_get_area_list_bulk');
+add_action('wp_ajax_create_order_to_ptc', 'ajax_pt_hms_create_new_order');
+add_action('wp_ajax_create_bulk_order_to_ptc', 'ajax_pt_hms_create_new_order_bulk');
+add_action('wp_ajax_get_wc_order', 'ajax_pt_wc_order_details');
+add_action('wp_ajax_get_wc_order_bulk', 'ajax_pt_wc_order_details_bulk');
+add_action('wp_ajax_get_ptc_user', 'ajax_pt_hms_get_user');
+
+$orderEventsStatusMap = [
+    'order.created' => 'Order_Created',
+    'order.updated' => 'Order_Updated',
+    'order.pickup-requested' => 'Pickup_Requested',
+    'order.assigned-for-pickup' => 'Assigned_for_Pickup',
+    'order.picked' => 'Picked',
+    'order.pickup-failed' => 'Pickup_Failed',
+    'order.pickup-cancelled' => 'Pickup_Cancelled',
+    'order.at-the-sorting-hub' => 'At_the_Sorting_HUB',
+    'order.in-transit' => 'In_Transit',
+    'order.received-at-last-mile-hub' => 'Received_at_Last_Mile_HUB',
+    'order.assigned-for-delivery' => 'Assigned_for_Delivery',
+    'order.delivered' => 'Delivered',
+    'order.partial-delivery' => 'Partial_Delivery',
+    'order.returned' => 'Return',
+    'order.delivery-failed' => 'Delivery_Failed',
+    'order.on-hold' => 'On_Hold',
+    'order.paid-return' => 'paid_return',
+    'order.exchanged' => 'exchange',
+    'order.paid' => 'Payment_Invoice',
+];
+
+function ptc_order_list_column_values_callback($value, $column_name, $post_meta)
+{
+    $value = $post_meta[$column_name] ?? $value;
+    return apply_filters('ptc_order_list_column_value_' . $column_name, $value);
+}
+
+function ptc_order_list_columns($columns = [])
+{
+    return apply_filters('custom_table_columns', [
+            'order_number' => __('Order', 'pathao_text_domain'),
+            'date' => __('Date', 'pathao_text_domain'),
+            'status' => __('Status', 'pathao_text_domain'),
+            'total' => __('Total', 'pathao_text_domain'),
+            'pathao' => __('Pathao Courier', 'pathao_text_domain'),
+            'pathao_status' => __('Pathao Courier Status', 'pathao_text_domain'),
+            'pathao_delivery_fee' => __('Pathao Courier Delivery Fee', 'pathao_text_domain'),
+
+        ] + $columns);
+}
+
+function pt_hms_ajax_get_stores()
+{
+    $stores = pt_hms_get_stores();
+    wp_send_json_success($stores);
+}
+
+function pt_hms_ajax_get_cities()
+{
+//    $cities = pathaoCacheRemember('cities', PTC_CACHE_TTL, function () {
+//        return pt_hms_get_cities();
+//    });
+
+    $cities = pt_hms_get_cities();;
+    wp_send_json_success($cities);
+}
+
+function pt_hms_ajax_get_zones()
+{
+    if (isset($_POST['city_id'])) {
+        $city_id = intval($_POST['city_id']);
+        $zones = pt_hms_get_zones($city_id);;
+        wp_send_json_success($zones);
+    } else {
+        wp_send_json_error('Missing city_id parameter.');
+    }
+}
+
+/**
+ * @return void
+ */
+function pt_hms_ajax_get_areas()
+{
+    if (isset($_POST['zone_id'])) {
+        $zone_id = intval($_POST['zone_id']);
+        $areas = pt_hms_get_areas($zone_id);
+        wp_send_json_success($areas);
+    } else {
+        wp_send_json_error('Missing zone_id parameter.');
+    }
+}
+
+function pt_hms_ajax_get_zone_list_bulk()
+{
+    $zones = pt_hms_get_zone_list_bulk();
+    wp_send_json_success($zones);
+}
+
+function pt_hms_ajax_get_area_list_bulk()
+{
+    $areas = pt_hms_get_area_list_bulk();
+    wp_send_json_success($areas);
+}
+
+function ajax_pt_hms_get_user()
+{
+    if ( ! current_user_can( 'manage_options' ) ) {
+        wp_send_json_error( array( 'message' => 'Unauthorized' ), 403 );
+    }
+
+    $response = pt_hms_get_user();
+
+    if ( $response === null ) {
+        wp_send_json_error( array( 'message' => 'Could not fetch user. Check API credentials and token.' ) );
+    }
+
+    wp_send_json_success( $response );
+}
+
+function ajax_pt_hms_create_new_order()
+{
+    $key = 'ptc_consignment_id';
+    // Check nonce for security
+    $nonce = wp_verify_nonce( $_SERVER['HTTP_X_WPTC_NONCE'] ?? '', 'wp_rest', false );
+
+    if(!$nonce){
+
+        wp_send_json_error([
+            'error' => 'validation_failed',
+            'message' => 'nonce mismatch'
+            ], 403);
+    }
+
+    // sanitize input fields
+    $orderData = array_map(function ($value) {
+        return sanitize_text_field(trim((string)$value));
+    }, $_POST['order_data'] ?? []);
+
+    $orderId = trim($orderData['merchant_order_id'] ?? '');
+
+    // check order already have the consignment id
+    if (get_post_meta($orderId, $key, true)) {
+        wp_send_json_error([
+            'error' => 'validation_failed',
+            'message' => 'Order already have a consignment id'
+            ], 403);
+    }
+
+    $order = wc_get_order($orderId);
+
+    if (!$order) {
+        wp_send_json_error('no_order', 'No order found', 404);
+    }
+
+    // Call function to create a new order
+    $response = pt_hms_create_new_order($orderData);
+
+    if (is_wp_error($response)) {
+        wp_send_json_error($response->get_error_message(), $response->get_error_code());
+    }
+
+    // add consignment_id to order meta
+    update_post_meta($orderId, 'ptc_consignment_id', $response['data']['consignment_id']);
+    update_post_meta($orderId, 'ptc_status', 'pending');
+    update_post_meta($orderId, 'ptc_delivery_fee', $response['data']['delivery_fee']);
+
+    // Send the response back to JavaScript
+    wp_send_json($response);
+}
+
+function ajax_pt_hms_create_new_order_bulk()
+{
+    // Check nonce for security
+    $nonce = wp_verify_nonce( $_SERVER['HTTP_X_WPTC_NONCE'] ?? '', 'wp_rest', false );
+
+    if(!$nonce){
+
+        wp_send_json_error([
+            'error' => 'validation_failed',
+            'message' => 'nonce mismatch'
+        ], 403);
+    }
+
+
+    // sanitize input fields
+    $orderData = array_map(function ($order) {
+
+        if (!is_array($order)) {
+            wp_send_json_error("Invalid Data", 403);
+        }
+        return makeDto($order);
+
+    }, $_POST['orders'] ?? []);
+
+    // Call function to create a new order
+    $response = pt_hms_create_new_order_bulk($orderData);
+
+    if (is_wp_error($response)) {
+        wp_send_json_error($response->get_error_message(), $response->get_error_code());
+    } else {
+        foreach ($orderData as $order) {
+            $orderId = $order['merchant_order_id'];
+            update_post_meta($orderId, 'ptc_status', 'pending');
+            update_post_meta($orderId, 'ptc_consignment_id', PTC_EMPTY_FLAG);
+        }
+    }
+
+    // Send the response back to JavaScript
+    wp_send_json($response);
+}
+
+function ajax_pt_wc_order_details()
+{
+    
+    $orderId =  (int)$_POST['order_id'] ?? null;
+
+    if (!$orderId) {
+        wp_send_json_error('no_order_id', 'No order id found', 404);
+    }
+
+    $order = wc_get_order($orderId);
+
+    if (!$order) {
+        wp_send_json_error('no_order', 'No order found', 404);
+    }
+
+    $orderData = getPtOrderData($order);
+
+    wp_send_json_success($orderData);
+}
+
+function ajax_pt_wc_order_details_bulk()
+{
+
+    $orderIds =  $_POST['order_id'] ?? null;
+
+    if (!$orderIds) {
+        wp_send_json_error('no_order_id', 'No order id found', 404);
+    }
+
+    $orderIds = explode(',', $orderIds);
+
+    $orderData = [];
+    foreach ($orderIds as $orderId) {
+        $order = wc_get_order($orderId);
+
+        if (!$order) {
+            continue;
+        }
+
+        if (metadata_exists('post', $order->get_id(), 'ptc_consignment_id')) {
+            continue;
+        }
+
+        $orderData[] = getPtOrderData($order);
+    }
+
+    wp_send_json_success($orderData);
+}
+
+/**
+ * @param bool|WC_Order|WC_Order_Refund $order
+ * @return array
+ */
+function getPtOrderData($order): array
+{
+    $orderData = $order->get_data();
+    $orderItems = 0;
+    $totalWeight = 0;
+    // add items to order
+    $orderData['items'] = array_values(array_map(function ($item) use (&$orderItems, &$totalWeight) {
+
+        $quantity = $item->get_quantity();
+        $totalWeight += (float)$item->get_product()->get_weight();
+
+        $orderItems += $quantity;
+
+        return [
+            'name' => $item->get_name(),
+            'quantity' => $item->get_quantity(),
+            'weight' => $totalWeight,
+            'price' => $item->get_total(),
+            'product_id' => $item->get_product_id(),
+            'variation_id' => $item->get_variation_id(),
+            'image' => wp_get_attachment_image_src($item->get_product()->get_image_id(), 'thumbnail')[0] ?? null,
+            'product_url' => $item->get_product()->get_permalink(),
+        ];
+
+    }, $order->get_items()));
+
+    $orderData['billing']['full_name'] = $order->get_formatted_billing_full_name();
+
+    $orderData['billing']['city_id'] = (int)$order->get_meta('_billing_pathao_city');
+    $orderData['billing']['zone_id'] = (int)$order->get_meta('_billing_pathao_zone');
+    $orderData['billing']['area_id'] = (int)$order->get_meta('_billing_pathao_area');
+
+    $orderData['shipping']['city_id'] = (int)$order->get_meta('_shipping_pathao_city');
+    $orderData['shipping']['zone_id'] = (int)$order->get_meta('_shipping_pathao_zone');
+    $orderData['shipping']['area_id'] = (int)$order->get_meta('_shipping_pathao_area');
+
+    $orderData['total_items'] = $orderItems;
+    $orderData['total_weight'] = $totalWeight;
+    $orderData['payment_date'] = $order->get_date_paid();
+
+    // Build default values for Pathao modal fields
+    $shippingAddress = trim(sprintf('%s, %s, %s, %s, %s',
+        $orderData['shipping']['address_1'] ?? '',
+        $orderData['shipping']['address_2'] ?? '',
+        $orderData['shipping']['city'] ?? '',
+        $orderData['shipping']['state'] ?? '',
+        $orderData['shipping']['postcode'] ?? ''
+    ));
+
+    $billingAddress = trim(sprintf('%s, %s, %s, %s, %s',
+        $orderData['billing']['address_1'] ?? '',
+        $orderData['billing']['address_2'] ?? '',
+        $orderData['billing']['city'] ?? '',
+        $orderData['billing']['state'] ?? '',
+        $orderData['billing']['postcode'] ?? ''
+    ));
+
+    $defaultAddress = (!empty($orderData['shipping']['address_1']) && !empty($orderData['shipping']['address_2']))
+        ? $shippingAddress
+        : $billingAddress;
+
+    $productDescriptions = implode("\n", array_map(function ($item) {
+        return "{$item['name']} x{$item['quantity']}";
+    }, $orderData['items']));
+
+    // Allow third-party code to provide context (e.g. custom order meta) to all field filters
+    $context = apply_filters('pathao_order_data_context', [], $order);
+
+    $recipientName = apply_filters(
+        'pathao_modal_recipient_name',
+        $orderData['billing']['full_name'],
+        $order,
+        $context
+    );
+
+    $recipientPhone = apply_filters(
+        'pathao_modal_recipient_phone',
+        $orderData['billing']['phone'],
+        $order,
+        $context
+    );
+
+    $recipientAddress = apply_filters(
+        'pathao_modal_recipient_address',
+        $defaultAddress,
+        $order,
+        $context
+    );
+
+    $itemDescription = apply_filters(
+        'pathao_modal_item_description',
+        $productDescriptions,
+        $order,
+        $context
+    );
+
+    // Resolve once per request, including requests containing multiple orders.
+    static $defaultStoreId = null;
+    if ($defaultStoreId === null) {
+        $stores = pt_hms_get_stores();
+        $defaultStoreId = (int)($stores[0]['store_id'] ?? 0);
+        foreach ($stores as $store) {
+            if (!empty($store['is_default_store'])) {
+                $defaultStoreId = (int)$store['store_id'];
+                break;
+            }
+        }
+    }
+
+    $modalDefaults = [
+        'recipient_name'    => sanitize_text_field($recipientName),
+        'recipient_phone'   => sanitize_text_field($recipientPhone),
+        'recipient_address' => sanitize_text_field($recipientAddress),
+        'item_description'  => sanitize_textarea_field($itemDescription),
+        'recipient_secondary_phone' => '',
+        'recipient_city' => $orderData['shipping']['city_id'] ?: $orderData['billing']['city_id'],
+        'recipient_zone' => $orderData['shipping']['zone_id'] ?: $orderData['billing']['zone_id'],
+        'recipient_area' => $orderData['shipping']['area_id'] ?: $orderData['billing']['area_id'],
+        'amount_to_collect' => $orderData['payment_date'] ? 0 : $orderData['total'],
+        'special_instruction' => '',
+        'store_id' => $defaultStoreId,
+        'delivery_type' => 48,
+        'item_type' => 2,
+        'item_quantity' => $orderItems,
+        'item_weight' => $totalWeight > 0 ? $totalWeight : 0.5,
+    ];
+    $filteredDefaults = apply_filters('pathao_modal_order_data', $modalDefaults, $order, $context);
+    $orderData['pathao'] = $modalDefaults;
+    if (is_array($filteredDefaults)) {
+        foreach ($modalDefaults as $field => $default) {
+            $orderData['pathao'][$field] = $filteredDefaults[$field] ?? $default;
+        }
+    }
+
+    return $orderData;
+}
+
+add_action('rest_api_init', 'register_custom_endpoint');
+
+function register_custom_endpoint() {
+    register_rest_route('ptc/v1', '/webhook', array(
+        'methods' => 'POST',
+        'callback' => 'ptc_webhook_handler',
+        'permission_callback' => function ($request) {
+
+            if (isset($_SERVER['HTTP_X_PATHAO_SIGNATURE'])) {
+                $client_secret = $_SERVER['HTTP_X_PATHAO_SIGNATURE'];
+                $secret = get_option('pt_hms_settings')['webhook_secret'] ?? null;
+
+                if (!$secret || $client_secret !== $secret) {
+                    return false;
+                }
+
+                return true;
+            }
+            return false;
+        },
+    ));
+}
+
+function ptc_webhook_handler($data) {
+
+    $event = $data['event'];
+
+    if ($event == 'webhook_integration') {
+        return webhookResponse('Successfully accepted webhook_integration', 202);
+    }
+
+    $orderId = $data['merchant_order_id'] ?? null;
+    $status = $data['order_status'] ?? null;
+    $event = $data['event'] ?? null;
+    $deliveryFee = $data['delivery_fee'] ?? null;
+    $consignmentID = $data['consignment_id'] ?? null;
+
+    if (!$status) {
+        global $orderEventsStatusMap;
+        $status = $orderEventsStatusMap[$event] ?? null;
+    }
+
+    $order = wc_get_order($orderId);
+
+    if (!$order) {
+        wp_send_json_error('no_order', 'No order found', 404);
+    }
+
+    if ($status) {
+        // Keep the original Pathao status on the WooCommerce order.
+        $order->update_meta_data('ptc_status', sanitize_text_field($status));
+    }
+
+    if ($deliveryFee !== null && $deliveryFee !== '') {
+        $order->update_meta_data('ptc_delivery_fee', wc_format_decimal($deliveryFee));
+    }
+
+    if ($consignmentID) {
+        $order->update_meta_data('ptc_consignment_id', sanitize_text_field($consignmentID));
+    }
+
+    if ($status) {
+        ptc_sync_woocommerce_order_status($order, $status);
+    }
+
+    $order->save();
+
+    return webhookResponse('Order and courier status updated', 202);
+}
+
+/**
+ * Sync selected Pathao delivery states to native WooCommerce order statuses.
+ *
+ * Defaults deliberately avoid cancelling/refunding an order just because a
+ * courier shipment was cancelled or returned. Store owners can customize the
+ * mapping with the ptc_wc_order_status_map filter.
+ *
+ * @param WC_Order $order  WooCommerce order.
+ * @param string   $status Pathao status.
+ * @return void
+ */
+function ptc_sync_woocommerce_order_status($order, $status) {
+    if (!$order instanceof WC_Order || !function_exists('wc_get_order_statuses')) {
+        return;
+    }
+
+    $normalized_status = strtolower(trim((string) $status));
+    $normalized_status = str_replace(array('.', '-', ' '), '_', $normalized_status);
+    $normalized_status = preg_replace('/^order_/', '', $normalized_status);
+
+    $status_map = array(
+        'delivered'          => 'completed',
+        'partial_delivery'   => 'on-hold',
+        'return'             => 'on-hold',
+        'returned'           => 'on-hold',
+        'delivery_failed'    => 'on-hold',
+        'pickup_cancelled'   => 'on-hold',
+        'on_hold'            => 'on-hold',
+    );
+
+    /**
+     * Filter the Pathao-to-WooCommerce order status mapping.
+     * Return WooCommerce status slugs without the "wc-" prefix.
+     * Set a Pathao status value to false to disable automatic status changes.
+     */
+    $status_map = apply_filters('ptc_wc_order_status_map', $status_map, $order, $status);
+    $target_status = $status_map[$normalized_status] ?? false;
+
+    if (!$target_status) {
+        return;
+    }
+
+    $target_status = sanitize_key($target_status);
+    $available_statuses = wc_get_order_statuses();
+    if (!isset($available_statuses['wc-' . $target_status])) {
+        return;
+    }
+
+    if ($order->get_status() === $target_status) {
+        return;
+    }
+
+    $order->update_status(
+        $target_status,
+        sprintf(
+            /* translators: 1: Pathao courier status. */
+            __('Order status automatically updated from Pathao courier status: %1$s', 'pathao-courier'),
+            sanitize_text_field($status)
+        ),
+        true
+    );
+}
+
+/**
+ * @return WP_Error|WP_HTTP_Response|WP_REST_Response
+ */
+function webhookResponse($message, $statusCode = 200)
+{
+    $response = rest_ensure_response(array(
+        'status' => $statusCode,
+        'message' => $message,
+        'data' => null
+    ));
+
+    $response->set_status($statusCode);
+    $response->header('X-Pathao-Merchant-Webhook-Integration-Secret', 'f3992ecc-59da-4cbe-a049-a13da2018d51');
+    return $response;
+}
+
+
+/**
+ * Cache remember helper – persistent cache if available,
+ * fallback to transients otherwise.
+ *
+ * @param string   $key
+ * @param int      $ttl     Seconds to store the cache.
+ * @param callable $callback Function that returns the value to cache.
+ *
+ * @return mixed
+ */
+function pathaoCacheRemember( $key, $ttl, $callback ) {
+
+    $cache_group = PTC_CACHE_GROUP;
+
+    // Check if persistent object cache is available
+    if ( wp_using_ext_object_cache() ) {
+
+        // Try object cache
+        $value = wp_cache_get( $key, $cache_group );
+
+        if ( false !== $value ) {
+            return $value;
+        }
+
+        // Cache miss → generate value
+        $value = call_user_func( $callback );
+
+        if (!$value) {
+            return false;
+        }
+
+        // Save in object cache
+        wp_cache_set( $key, $value, $cache_group, $ttl );
+
+        return $value;
+    }
+
+    // Fallback to transients
+    $transient_key = PTC_CACHE_GROUP . $key;
+
+    $value = get_transient( $transient_key );
+
+    if ( false !== $value ) {
+        return $value;
+    }
+
+    // Cache miss → generate value
+    $value = call_user_func( $callback );
+
+    if (!$value) {
+        return false;
+    }
+
+    // Save in transient cache
+    set_transient( $transient_key, $value, $ttl );
+
+    return $value;
+}

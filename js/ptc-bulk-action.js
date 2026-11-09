@@ -1,0 +1,622 @@
+jQuery(document).ready(function ($) {
+
+    let hotInstance;
+    const list = $("#ptc-response-list");
+    const loading = $("#ptc-bulk-loading-img");
+    const modal = $("#ptc-bulk-modal-overlay");
+    /** When true, merchant country_id is 1: skip city/zone/area columns and fetching */
+    let ptcSkipLocationFields = false;
+
+    function createBulkOrder(orders) {
+        $('#modal-confirm').prop('disabled', true);
+        loading.fadeIn()
+        return $.post({
+            url: ajaxurl,
+            headers: {
+                'X-WPTC-Nonce': ptcSettings.nonce
+            },
+            data: {
+                action: "create_bulk_order_to_ptc",
+                orders: orders
+            },
+            success: function (response) {
+                loading.fadeOut()
+                const message = response.message
+                list.empty();
+                list.append(`<li style='color: #00a32a'>${message}</li>`)
+
+
+                setTimeout(() => {
+                    hotInstance?.destroy();
+                    $('#ptc-bulk-modal-overlay').fadeOut();
+                    location.reload();
+                }, 2000);
+            },
+            error: function (xhr, status, errorThrown) {
+                loading.fadeOut()
+                const res = xhr.responseJSON || {};
+                const errors = res.data?.errors || res.errors || {};
+                list.empty();
+
+                // Show each error in the UL
+                Object.entries(errors).forEach(([path, msgs]) => {
+                    const msg = Array.isArray(msgs) ? msgs.join(", ") : String(msgs);
+                    list.append(`<li style="color:#d33">${msg}</li>`);
+                });
+
+                if (!Object.keys(errors).length) {
+                    list.append(`<li style="color:#d33">Unexpected error: ${errText || 'Unknown'}</li>`);
+                }
+
+                $('#modal-confirm').prop('disabled', false);
+            }
+        });
+    }
+
+    // Preload Button Handler in Bulk Modal
+    $('#ptc-bulk-preload-btn').on('click', async function () {
+        const $btn = $(this);
+        const $progressContainer = $('#ptc-bulk-preload-progress');
+        const $bar = $('#ptc-bulk-preload-bar');
+        const $status = $('#ptc-bulk-preload-status');
+        const $percent = $('#ptc-bulk-preload-percent');
+
+        $btn.prop('disabled', true);
+        $progressContainer.show();
+        $bar.css('width', '0%');
+        $status.text('Starting...');
+        $percent.text('0%');
+
+        try {
+            await LocationDataManager.fetchAllWithProgress((current, total, message) => {
+                const percentage = Math.round((current / total) * 100);
+                $bar.css('width', `${percentage}%`);
+                $status.text(message);
+                $percent.text(`${percentage}%`);
+            });
+
+            // Complete
+            $('#ptc-bulk-preload-container').hide();
+            $('#hot-container').show();
+            $('#ptc-modal-footer').show();
+
+            // Resume normal flow
+            const selectedOrders = getSelectedOrders();
+            await renderHandsontable(selectedOrders);
+
+        } catch (e) {
+            console.error(e);
+            $status.text(e && e.message ? e.message : 'Error occurred. Please try again.');
+            $bar.css('background', '#d63638');
+            $btn.prop('disabled', false);
+        }
+    });
+
+    function getOrders(orderIds) {
+        loading.show();
+        $('#modal-confirm').prop('disabled', true);
+        return new Promise((resolve, reject) => {
+            $.post(ajaxurl, {
+                action: 'get_wc_order_bulk',
+                order_id: orderIds
+            })
+                .done(response => {
+                    const orders = response?.data;
+                    resolve(orders);
+                    loading.hide();
+                    $('#modal-confirm').prop('disabled', false);
+                })
+                .fail(err => reject(err));
+        });
+    }
+
+    function getDeliveryTypes() {
+        return [
+            { id: 48, name: "Normal Delivery", selected: true },
+            { id: 12, name: "On Demand", selected: false },
+            { id: 24, name: "Express Delivery", selected: false }
+        ];
+    }
+
+    function populateBulkModalData(data, stores, deliveryTypes, itemTypes) {
+
+        const defaults = data.pathao;
+
+        return {
+            merchant_order_id: data.id,
+            recipient_name: defaults.recipient_name,
+            recipient_phone: defaults.recipient_phone,
+            recipient_secondary_phone: defaults.recipient_secondary_phone,
+            recipient_address: defaults.recipient_address,
+            recipient_city: null,
+            recipient_zone: null,
+            recipient_area: null,
+            amount_to_collect: defaults.amount_to_collect,
+            item_description: defaults.item_description,
+            special_instruction: defaults.special_instruction,
+            store_id: stores.find(item => item.id == defaults.store_id)?.name ?? '',
+            delivery_type: deliveryTypes.find(item => item.id == defaults.delivery_type)?.name ?? '',
+            item_type: itemTypes.find(item => item.id == defaults.item_type)?.name ?? '',
+            item_quantity: defaults.item_quantity,
+            item_weight: defaults.item_weight
+        }
+
+    }
+
+    function getItemTypes() {
+        return [
+            { id: 2, name: "Parcel" },
+            { id: 1, name: "Document", selected: false },
+            { id: 3, name: "Fragile", selected: false }
+        ];
+    }
+
+    let stores = [];
+    let deliveryTypes = [];
+    let itemTypes = [];
+    let storesWithID = {}
+    let cityWithID = {}
+    let deliveryTypesWithID = {}
+    let itemTypesWithID = {}
+
+    async function renderHandsontable(selectedOrders) {
+        const container = document.getElementById('hot-container');
+
+        // Check country_id to determine if we skip location fields
+        try {
+            const userRes = await LocationDataManager.getUserInfo();
+            ptcSkipLocationFields = !!(userRes && userRes.data && userRes.data.country_id === 1);
+        } catch (e) {
+            ptcSkipLocationFields = false;
+        }
+
+        const storesData = await LocationDataManager.getStores();
+        const citiesData = ptcSkipLocationFields ? [] : await LocationDataManager.getCities();
+
+        stores = storesData;
+        const storesOnlyNames = stores?.map((item) => {
+            storesWithID[item.name] = item.id
+            return item.name
+        })
+
+        const cities = citiesData;
+        const citiesOnlyNames = ptcSkipLocationFields ? [] : cities?.map((item) => {
+            const name = LocationDataManager.normalize(item.name);
+            cityWithID[name] = item
+            cityWithID[name].zoneWithID = {}
+            cityWithID[name].zones = []
+            return name
+        })
+
+        deliveryTypes = getDeliveryTypes();
+        const deliveryTypesOnlyNames = deliveryTypes.map((item) => {
+            deliveryTypesWithID[item.name] = item.id
+            return item.name
+        })
+
+        itemTypes = getItemTypes();
+        const itemTypesOnlyNames = itemTypes.map((item) => {
+            itemTypesWithID[item.name] = item.id
+            return item.name
+        })
+
+        const orderBulkDetails = await getOrders(selectedOrders.join(','))
+        const data = (orderBulkDetails)?.map(order => populateBulkModalData(order, stores, deliveryTypes, itemTypes));
+
+        // Build columns array conditionally based on country_id
+        const columns = [
+            { data: 'merchant_order_id', readOnly: true },
+            { data: 'recipient_name', type: 'text' },
+            { data: 'recipient_phone', type: 'text' },
+            { data: 'recipient_secondary_phone', type: 'text' },
+        ];
+
+        // Add city/zone/area columns only if country_id !== 1
+        if (!ptcSkipLocationFields) {
+            columns.push(
+                {
+                    data: 'recipient_city',
+                    type: 'dropdown',
+                    source: citiesOnlyNames,
+                    optionLabel: 'name',
+                    value: 'id',
+                    allowInvalid: false,
+                    filter: true,
+                    validator: async function (value, callback) {
+                        if (this.instance?.isEmptyRow(this.row)) {
+                            callback(true);
+                            return;
+                        }
+
+                        if (!value) {
+                            callback(true)
+                            return;
+                        }
+
+                        value = LocationDataManager.normalize(value);
+
+                        const city = citiesOnlyNames.find(name => name === value ? value : '');
+
+                        if (!city) {
+                            callback(false)
+                            return
+                        }
+                        callback(true)
+
+                        const cityDetails = cityWithID[value];
+
+                        // Fetch zones using LocationDataManager
+                        const zones = await LocationDataManager.getZones(cityDetails.id);
+
+                        cityWithID[value].zones = zones.map((item) => {
+                            const name = LocationDataManager.normalize(item.name);
+                            cityWithID[value].zoneWithID[name] = item
+                            cityWithID[value].zoneWithID[name].areaWithID = {}
+                            cityWithID[value].zoneWithID[name].areas = []
+                            return name;
+                        });
+
+                        this.instance.setCellMeta(this.row, 5, 'source', cityWithID[value].zones);
+                    },
+                },
+                {
+                    data: 'recipient_zone',
+                    type: 'dropdown',
+                    source: [],
+                    optionLabel: 'name',
+                    value: 'id',
+                    allowInvalid: false,
+                    filter: true,
+                    validator: async function (value, callback) {
+                        if (this.instance?.isEmptyRow(this.row)) {
+                            callback(true);
+                            return;
+                        }
+
+                        if (!value) {
+                            callback(true)
+                            return;
+                        }
+
+                        value = LocationDataManager.normalize(value);
+
+                        const cityValue = LocationDataManager.normalize(this.instance.getDataAtCell(this.row, 4));
+
+                        // Ensure zones are loaded for this city
+                        if (!cityWithID[cityValue] || !cityWithID[cityValue].zones) {
+                            callback(false);
+                            return;
+                        }
+
+                        const zone = cityWithID[cityValue].zones.find(name => name === value ? value : '');
+                        if (!zone) {
+                            callback(false)
+                            return
+                        }
+                        callback(true)
+
+                        const zoneDetails = cityWithID[cityValue].zoneWithID[value]
+
+                        // Fetch areas using LocationDataManager
+                        const areas = await LocationDataManager.getAreas(zoneDetails.id);
+
+                        cityWithID[cityValue].zoneWithID[value].areas = areas.map((item) => {
+                            const name = LocationDataManager.normalize(item.name);
+                            cityWithID[cityValue].zoneWithID[value].areaWithID[name] = item
+                            return name
+                        })
+
+                        this.instance.setCellMeta(this.row, 6, 'source', cityWithID[cityValue].zoneWithID[value].areas);
+
+                    },
+                },
+                {
+                    data: 'recipient_area',
+                    type: 'dropdown',
+                    source: [],
+                    optionLabel: 'name',
+                    value: 'id',
+                    allowInvalid: true,
+                    filter: true,
+                    validator: async function (value, callback) {
+                        if (this.instance?.isEmptyRow(this.row)) {
+                            callback(true);
+                            return;
+                        }
+
+                        if (!value) {
+                            callback(true)
+                            return;
+                        }
+
+                        value = LocationDataManager.normalize(value);
+
+                        const cityValue = LocationDataManager.normalize(this.instance.getDataAtCell(this.row, 4));
+                        const zoneValue = LocationDataManager.normalize(this.instance.getDataAtCell(this.row, 5));
+
+                        if (!cityWithID[cityValue] ||
+                            !cityWithID[cityValue].zoneWithID[zoneValue] ||
+                            !cityWithID[cityValue].zoneWithID[zoneValue].areas) {
+                            callback(false);
+                            return;
+                        }
+
+                        const area = cityWithID[cityValue].zoneWithID[zoneValue].areas.find(name => name === value ? value : '');
+                        if (!area) {
+                            callback(false)
+                            return
+                        }
+                        callback(true)
+
+                    },
+                }
+            );
+        }
+
+        // Add remaining columns
+        columns.push(
+                { data: 'recipient_address', type: 'text' },
+                { data: 'amount_to_collect', type: 'numeric' },
+                { data: 'item_description', type: 'text' },
+                { data: 'special_instruction', type: 'text' },
+                {
+                    data: 'store_id',
+                    type: 'dropdown',
+                    source: storesOnlyNames,
+                    optionLabel: 'name',
+                    value: 'id',
+                    allowInvalid: true,
+                    strict: true,
+                },
+                {
+                    data: 'delivery_type',
+                    type: 'dropdown',
+                    source: deliveryTypesOnlyNames,
+                    optionLabel: 'name',
+                    value: 'id',
+                    allowInvalid: true,
+                    strict: true,
+                },
+                {
+                    data: 'item_type',
+                    type: 'dropdown',
+                    source: itemTypesOnlyNames,
+                    optionLabel: 'name',
+                    value: 'id',
+                    allowInvalid: true,
+                    strict: true,
+                },
+                {
+                    data: 'item_quantity',
+                    type: 'numeric'
+                },
+                {
+                    data: 'item_weight',
+                    type: 'numeric',
+                }
+        );
+
+        // Build colHeaders conditionally
+        const colHeaders = [
+            'Order ID',
+            'Recipient Name',
+            'Recipient Phone',
+            'Recipient Secondary Phone',
+        ];
+        if (!ptcSkipLocationFields) {
+            colHeaders.push('Recipient City', 'Recipient Zone', 'Recipient Area');
+        }
+        colHeaders.push(
+            'Address',
+            'Collectable Amount',
+            'Note',
+            'Special Instruction',
+            'Store',
+            'Delivery Type',
+            'Item Type',
+            'Quantity',
+            'Weight'
+        );
+
+        hotInstance = new Handsontable(container, {
+            data: data,
+            columns: columns,
+            colHeaders: colHeaders,
+            rowHeaders: true,
+            width: '100%',
+            height: 300,
+            stretchH: 'all',
+            licenseKey: 'non-commercial-and-evaluation'
+        });
+
+        // Only prefill locations if country_id !== 1
+        if (!ptcSkipLocationFields) {
+            await prefillOrderLocations(hotInstance, orderBulkDetails, cities);
+        }
+    }
+
+    async function prefillOrderLocations(hotInstance, orderBulkDetails, cities) {
+        const rows = hotInstance.getData();
+        for (let rowIndex = 0; rowIndex < rows.length; rowIndex++) {
+            const orderId = hotInstance.getDataAtCell(rowIndex, 0);
+            const orderDetails = orderBulkDetails.find((item) => item.id === orderId);
+
+            let defaultCityId = orderDetails?.pathao?.recipient_city;
+            let defaultZoneId = orderDetails?.pathao?.recipient_zone;
+            let defaultAreaId = orderDetails?.pathao?.recipient_area;
+
+            if (defaultCityId) {
+                let defaultCity = cities.find((city) => city.id == defaultCityId);
+                if (defaultCity) {
+                    const defaultCityName = LocationDataManager.normalize(defaultCity.name);
+                    hotInstance.setDataAtCell(rowIndex, 4, defaultCityName);
+
+                    try {
+                        const items = await LocationDataManager.getZones(defaultCity.id);
+                        cityWithID[defaultCityName].zones = items.map(item => LocationDataManager.normalize(item.name));
+
+                        items.forEach((item) => {
+                            const name = LocationDataManager.normalize(item.name);
+                            cityWithID[defaultCityName].zoneWithID[name] = item;
+                            cityWithID[defaultCityName].zoneWithID[name].areaWithID = {};
+                            cityWithID[defaultCityName].zoneWithID[name].areas = [];
+                        });
+
+                        const defaultZone = items.find((zone) => zone.id == defaultZoneId);
+
+                        if (defaultZone) {
+                            const defaultZoneName = LocationDataManager.normalize(defaultZone.name);
+                            hotInstance.setDataAtCell(rowIndex, 5, defaultZoneName);
+
+                            try {
+                                const areas = await LocationDataManager.getAreas(defaultZone.id);
+                                cityWithID[defaultCityName].zoneWithID[defaultZoneName].areas = areas.map(item => LocationDataManager.normalize(item.name));
+
+                                areas.forEach((item) => {
+                                    const name = LocationDataManager.normalize(item.name);
+                                    cityWithID[defaultCityName].zoneWithID[defaultZoneName].areaWithID[name] = item;
+                                });
+
+                                const defaultArea = areas.find((area) => area.id == defaultAreaId);
+                                if (defaultArea) {
+                                    hotInstance.setDataAtCell(rowIndex, 6, LocationDataManager.normalize(defaultArea.name));
+                                }
+                            } catch (e) {
+                                console.error('Error prefilling areas', e);
+                            }
+                        }
+                    } catch (e) {
+                        console.error('Error prefilling zones', e);
+                    }
+                }
+            }
+        }
+    }
+
+    $(document).on('click', '#ptc-bulk-modal-overlay', function (e) {
+        if (e.target === this) {
+            $(this).fadeOut();
+            hotInstance?.destroy();
+        }
+    });
+
+    $(document).on('click', '#post-send_with_pathao_bulk', function (e) {
+        e.preventDefault();
+        list.empty();
+        openModal()
+    });
+
+    $(document).on('click', '#posts-filter #doaction, #posts-filter #doaction2, #wc-orders-filter #doaction, #wc-orders-filter #doaction2, #posts-filter [name="bulk_action"], #wc-orders-filter [name="bulk_action"]', function (e) {
+        const form = $(this).closest('form');
+        const actionName = this.id === 'doaction2' ? 'action2' : 'action';
+        const action = form.find(`select[name="${actionName}"]`).val();
+
+        if (action === 'send_with_pathao') {
+            e.preventDefault();
+            list.empty();
+            openModal();
+        }
+    });
+
+
+    function getSelectedOrders() {
+        const selected = [];
+        $('input[name="post[]"]:checked').each(function () {
+            selected.push($(this).val());
+        });
+        // support for new woocommerce order table
+        $('.wc-order-bulk-action-check:checked').each(function () {
+            selected.push($(this).val());
+        });
+        // support for legacy/other selection method if needed (from old openModal)
+        $('input[name="id[]"]:checked').each(function () {
+            selected.push($(this).val());
+        });
+
+        return [...new Set(selected)];
+    }
+
+    async function openModal() {
+        const selectedOrders = getSelectedOrders();
+
+        if (selectedOrders.length === 0) {
+            alert('Please select at least one order.');
+            return;
+        }
+
+        modal.show();
+        list.empty();
+
+        // Reset UI states
+        $('#ptc-bulk-preload-container').hide();
+        $('#hot-container').hide();
+        $('#ptc-modal-footer').hide();
+        loading.hide();
+
+        // Check country_id first
+        try {
+            const userRes = await LocationDataManager.getUserInfo();
+            ptcSkipLocationFields = !!(userRes && userRes.data && userRes.data.country_id === 1);
+        } catch (e) {
+            ptcSkipLocationFields = false;
+        }
+
+        // If country_id === 1, skip preload check and show table directly
+        // Otherwise, check if location data is cached
+        if (ptcSkipLocationFields || LocationDataManager.loadFromStorage()) {
+            // Data exists or country_id === 1, proceed normally
+            $('#hot-container').show();
+            $('#ptc-modal-footer').show();
+            loading.show();
+            await renderHandsontable(selectedOrders);
+            loading.hide();
+        } else {
+            // Data missing and country_id !== 1, show preload UI
+            $('#ptc-bulk-preload-container').show();
+        }
+    }
+
+    // Event handlers for modal buttons
+    $('#modal-confirm').on('click', async function () {
+        if (!hotInstance) return;
+        const data = hotInstance.getSourceData();
+        // Filter out empty rows or invalid data if necessary
+        const validData = data.filter(row => row.recipient_name && row.recipient_phone && row.recipient_address);
+
+        if (validData.length === 0) {
+            alert('No valid data to send.');
+            return;
+        }
+
+        loading.show();
+        list.empty();
+
+        const ordersToCreate = validData.map(order => {
+            const mappedOrder = {
+                ...order,
+                store_id: storesWithID[order.store_id],
+                delivery_type: deliveryTypesWithID[order.delivery_type],
+                item_type: itemTypesWithID[order.item_type]
+            };
+            // Only map city/zone/area if country_id !== 1
+            if (!ptcSkipLocationFields) {
+                mappedOrder.recipient_city = cityWithID[LocationDataManager.normalize(order.recipient_city)]?.id;
+                mappedOrder.recipient_zone = cityWithID[LocationDataManager.normalize(order.recipient_city)]?.zoneWithID[LocationDataManager.normalize(order.recipient_zone)]?.id;
+                mappedOrder.recipient_area = cityWithID[LocationDataManager.normalize(order.recipient_city)]?.zoneWithID[LocationDataManager.normalize(order.recipient_zone)]?.areaWithID[LocationDataManager.normalize(order.recipient_area)]?.id;
+            }
+            return mappedOrder;
+        });
+
+        await createBulkOrder(ordersToCreate);
+
+        loading.hide();
+
+    });
+
+    $('#modal-cancel').on('click', function () {
+        hotInstance?.destroy();
+        list.empty();
+        modal.fadeOut();
+    });
+
+});
